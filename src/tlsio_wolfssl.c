@@ -16,6 +16,8 @@
 #include "azure_c_shared_utility/socketio.h"
 #include "azure_c_shared_utility/crt_abstractions.h"
 #include "azure_c_shared_utility/xlogging.h"
+#include "azure_c_shared_utility/shared_util_options.h"
+
 
 typedef enum TLSIO_STATE_ENUM_TAG
 {
@@ -46,6 +48,8 @@ typedef struct TLS_IO_INSTANCE_TAG
     ON_SEND_COMPLETE on_send_complete;
     void* on_send_complete_callback_context;
     char* certificate;
+    char* x509certificate;
+    char* x509privatekey;
     char* hostname;
     int port;
 } TLS_IO_INSTANCE;
@@ -54,18 +58,42 @@ typedef struct TLS_IO_INSTANCE_TAG
 static void* tlsio_wolfssl_CloneOption(const char* name, const void* value)
 {
     void* result;
-    if (
-        (name == NULL) || (value == NULL)
-        )
+    if ((name == NULL) || (value == NULL))
     {
+        LogError("invalid parameter detected: const char* name=%p, const void* value=%p", name, value);
         result = NULL;
     }
     else
     {
         if (strcmp(name, "TrustedCerts") == 0)
         {
+            if(mallocAndStrcpy_s((char**)&result, value) != 0)
+            {
+                LogError("unable to mallocAndStrcpy_s TrustedCerts value");
+                result = NULL;
+            }
+            else
+            {
+                /*return as is*/
+            }
+        }
+        else if (strcmp(name, SU_OPTION_X509_CERT) == 0)
+        {
             if (mallocAndStrcpy_s((char**)&result, value) != 0)
             {
+                LogError("unable to mallocAndStrcpy_s x509certificate value");
+                result = NULL;
+            }
+            else
+            {
+                /*return as is*/
+            }
+        }
+        else if (strcmp(name, SU_OPTION_X509_PRIVATE_KEY) == 0)
+        {
+            if (mallocAndStrcpy_s((char**)&result, value) != 0)
+            {
+                LogError("unable to mallocAndStrcpy_s x509privatekey value");
                 result = NULL;
             }
             else
@@ -75,7 +103,7 @@ static void* tlsio_wolfssl_CloneOption(const char* name, const void* value)
         }
         else
         {
-            /*option is not handled*/
+            LogError("not handled option : %s", name);
             result = NULL;
         }
     }
@@ -86,15 +114,21 @@ static void* tlsio_wolfssl_CloneOption(const char* name, const void* value)
 static void tlsio_wolfssl_DestroyOption(const char* name, const void* value)
 {
     /*since all options for this layer are actually string copies., disposing of one is just calling free*/
-    if ((name != NULL) && (value != NULL))
+    if ((name == NULL) || (value == NULL))
     {
-        if (strcmp(name, "TrustedCerts") == 0)
-        {
-            free((void*)value);
-        }
+        LogError("invalid parameter detected: const char* name=%p, const void* value=%p", name, value);
+    }
+	else
+	{
+		if ((strcmp(name, "TrustedCerts") == 0) ||
+			(strcmp(name, SU_OPTION_X509_CERT) == 0) ||
+			(strcmp(name, SU_OPTION_X509_PRIVATE_KEY) == 0))
+		{
+			free((void*)value);
+		}
         else
         {
-            /*option is not handled*/
+            LogError("not handled option : %s", name);
         }
     }
 }
@@ -350,6 +384,32 @@ static int add_certificate_to_store(TLS_IO_INSTANCE* tls_io_instance)
     return result;
 }
 
+static int x509_wolfssl_add_credentials(WOLFSSL* ssl, char* x509certificate, char* x509privatekey) {
+
+    int result;
+
+    if (wolfSSL_use_certificate_buffer(ssl, (unsigned char*)x509certificate, strlen(x509certificate)+1, SSL_FILETYPE_PEM) != SSL_SUCCESS)
+    {
+        LogError("unable to load x509 client certificate");
+        result = __LINE__;
+    }
+    else if (wolfSSL_use_PrivateKey_buffer(ssl, (unsigned char*)x509privatekey, strlen(x509privatekey)+1, SSL_FILETYPE_PEM) != SSL_SUCCESS)
+    {
+        LogError("unable to load x509 client private key");
+        result = __LINE__;
+    }
+    else
+    {
+        result = 0;
+    }
+    return result;
+}
+
+static void destroy_wolfssl_instance(TLS_IO_INSTANCE* tls_io_instance)
+{
+    wolfSSL_free(tls_io_instance->ssl);
+}
+
 static int create_wolfssl_instance(TLS_IO_INSTANCE* tls_io_instance)
 {
     int result;
@@ -367,6 +427,19 @@ static int create_wolfssl_instance(TLS_IO_INSTANCE* tls_io_instance)
             wolfSSL_CTX_free(tls_io_instance->ssl_context);
             result = __LINE__;
         }
+        /*x509 authentication can only be build before underlying connection is realized*/
+        else if((tls_io_instance->x509certificate != NULL) &&
+                (tls_io_instance->x509privatekey != NULL) &&
+                (x509_wolfssl_add_credentials(tls_io_instance->ssl, tls_io_instance->x509certificate, tls_io_instance->x509privatekey) != 0))
+        {
+            destroy_wolfssl_instance(tls_io_instance);
+            tls_io_instance->ssl = NULL;
+            wolfSSL_CTX_free(tls_io_instance->ssl_context);
+            tls_io_instance->ssl_context = NULL;
+            LogError("unable to use x509 authentication");
+            result = __LINE__;
+        }
+
         else
         {
             tls_io_instance->socket_io_read_bytes = NULL;
@@ -386,11 +459,6 @@ static int create_wolfssl_instance(TLS_IO_INSTANCE* tls_io_instance)
         }
     }
     return result;
-}
-
-static void destroy_wolfssl_instance(TLS_IO_INSTANCE* tls_io_instance)
-{
-    wolfSSL_free(tls_io_instance->ssl);
 }
 
 int tlsio_wolfssl_init(void)
@@ -430,6 +498,8 @@ CONCRETE_IO_HANDLE tlsio_wolfssl_create(void* io_create_parameters)
             result->ssl = NULL;
             result->ssl_context = NULL;
             result->certificate = NULL;
+            result->x509certificate = NULL;
+            result->x509privatekey = NULL;
 
             result->on_bytes_received = NULL;
             result->on_bytes_received_context = NULL;
@@ -499,6 +569,16 @@ void tlsio_wolfssl_destroy(CONCRETE_IO_HANDLE tls_io)
         {
             free(tls_io_instance->certificate);
             tls_io_instance->certificate = NULL;
+        }
+        if (tls_io_instance->x509certificate != NULL)
+        {
+            free(tls_io_instance->x509certificate);
+            tls_io_instance->x509certificate = NULL;
+        }
+        if (tls_io_instance->x509privatekey != NULL)
+        {
+            free(tls_io_instance->x509privatekey);
+            tls_io_instance->x509privatekey = NULL;
         }
         wolfSSL_CTX_free(tls_io_instance->ssl_context);
         xio_destroy(tls_io_instance->socket_io);
@@ -686,6 +766,7 @@ int tlsio_wolfssl_setoption(CONCRETE_IO_HANDLE tls_io, const char* optionName, c
         if (strcmp("TrustedCerts", optionName) == 0)
         {
             const char* cert = (const char*)value;
+
             if (tls_io_instance->certificate != NULL)
             {
                 // Free the memory if it has been previously allocated
@@ -694,24 +775,69 @@ int tlsio_wolfssl_setoption(CONCRETE_IO_HANDLE tls_io, const char* optionName, c
 
             // Store the certificate
             size_t len = strlen(cert);
-            tls_io_instance->certificate = (const char*)malloc(len+1);
+            tls_io_instance->certificate = malloc(len+1);
             if (tls_io_instance->certificate == NULL)
             {
                 result = __LINE__;
             }
             else
             {
-                (void)strcpy(tls_io_instance->certificate, cert);
+                strcpy(tls_io_instance->certificate, cert);
                 result = 0;
             }
         }
-        else if (tls_io_instance->socket_io == NULL)
+        else if (strcmp(SU_OPTION_X509_CERT, optionName) == 0)
         {
-            result = __LINE__;
+            if (tls_io_instance->x509certificate != NULL)
+            {
+                LogError("unable to set x509 options more than once");
+                result = __LINE__;
+            }
+            else
+            {
+                /*let's make a copy of this option*/
+                if (mallocAndStrcpy_s((char**)&tls_io_instance->x509certificate, value) != 0)
+                {
+                    LogError("unable to mallocAndStrcpy_s");
+                    result = __LINE__;
+                }
+                else
+                {
+                    result = 0;
+                }
+            }
+        }
+        else if (strcmp(SU_OPTION_X509_PRIVATE_KEY, optionName) == 0)
+        {
+            if (tls_io_instance->x509privatekey != NULL)
+            {
+                LogError("unable to set more than once x509 options");
+                result = __LINE__;
+            }
+            else
+            {
+                /*let's make a copy of this option*/
+                if (mallocAndStrcpy_s((char**)&tls_io_instance->x509privatekey, value) != 0)
+                {
+                    LogError("unable to mallocAndStrcpy_s");
+                    result = __LINE__;
+                }
+                else
+                {
+                    result = 0;
+                }
+            }
         }
         else
         {
-            result = xio_setoption(tls_io_instance->socket_io, optionName, value);
+            if (tls_io_instance->socket_io == NULL)
+            {
+                result = __LINE__;
+            }
+            else
+            {
+                result = xio_setoption(tls_io_instance->socket_io, optionName, value);
+            }
         }
     }
 
